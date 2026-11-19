@@ -251,3 +251,246 @@ def test_mutation_crud(client):
     client.delete("/samples/100")
     rows = client.get("/tables/results").json()["rows"]
     assert all(r["id"] != 200 for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# 行数上限（每表 500 行，新增才受限；更新既有 ID 始终允许）
+# --------------------------------------------------------------------------- #
+def _seed_full(samples, results=0):
+    """把两表整表重置到指定行数（绕过接口，直接写库）。"""
+    from app import db
+
+    db.reset_and_seed(
+        {
+            "samples": [
+                {"id": i, "batch": f"S{i % 7}"} for i in range(1, samples + 1)
+            ],
+            "results": [
+                {"id": 1000 + i, "sample_id": 1, "value": i}
+                for i in range(results)
+            ],
+        }
+    )
+
+
+def _counts(client):
+    meta = client.get("/meta").json()["tables"]
+    return {
+        "samples": meta["samples"]["row_count"],
+        "results": meta["results"]["row_count"],
+    }
+
+
+def test_cap_rejects_new_row_without_inserting(client):
+    _seed_full(500)
+    resp = client.put("/samples", json={"id": 901, "batch": "X"})
+    assert resp.status_code == 422
+    # 这是原始缺陷：返回 422 的同时第 501 行却已入库
+    assert _counts(client) == {"samples": 500, "results": 0}
+    assert all(r["id"] != 901 for r in client.get("/tables/samples").json()["rows"])
+
+
+def test_cap_update_existing_row_allowed(client):
+    _seed_full(500)
+    resp = client.put("/samples", json={"id": 1, "batch": "UPDATED"})
+    assert resp.status_code == 200
+    assert _counts(client)["samples"] == 500
+    rows = client.get("/tables/samples").json()["rows"]
+    assert next(r for r in rows if r["id"] == 1)["batch"] == "UPDATED"
+
+
+def test_cap_is_per_table(client):
+    # samples 已满不影响 results 新增
+    _seed_full(500, 499)
+    assert client.put(
+        "/results", json={"id": 2001, "sample_id": 1, "value": 5}
+    ).status_code == 200
+    assert _counts(client) == {"samples": 500, "results": 500}
+
+    # results 已满时再新增被拒，且不改动任何数据
+    before = _counts(client)
+    resp = client.put("/results", json={"id": 2002, "sample_id": 1, "value": 5})
+    assert resp.status_code == 422
+    assert _counts(client) == before
+
+
+def test_cap_update_existing_result_allowed_when_full(client):
+    _seed_full(500, 500)
+    resp = client.put("/results", json={"id": 1000, "sample_id": 1, "value": 99})
+    assert resp.status_code == 200
+    rows = client.get("/tables/results").json()["rows"]
+    assert next(r for r in rows if r["id"] == 1000)["value"] == 99
+
+
+def test_cap_allows_insert_after_delete(client):
+    _seed_full(500, 500)
+    assert client.delete("/samples/500").status_code == 200
+    assert client.put(
+        "/samples", json={"id": 901, "batch": "X"}
+    ).status_code == 200
+    assert _counts(client)["samples"] == 500
+
+    assert client.delete("/results/1000").status_code == 200
+    assert client.put(
+        "/results", json={"id": 2001, "sample_id": 1, "value": 5}
+    ).status_code == 200
+    assert _counts(client)["results"] == 500
+
+
+def test_cap_over_limit_legacy_data_still_updatable(client):
+    # 历史数据已经 501 行（超出上限）时：更新仍允许，新增一律拒绝
+    _seed_full(501)
+    assert client.put(
+        "/samples", json={"id": 1, "batch": "OVER"}
+    ).status_code == 200
+    assert _counts(client)["samples"] == 501
+    resp = client.put("/samples", json={"id": 901, "batch": "X"})
+    assert resp.status_code == 422
+    assert _counts(client)["samples"] == 501
+
+
+def _race(calls):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return list(pool.map(lambda fn: fn(), calls))
+
+
+def test_cap_one_of_two_ids_wins_last_slot(client):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_full(499)
+    # 已有一个 TestClient 在用；竞争写入各自开独立客户端与连接
+    def submit(sample_id):
+        def run():
+            with TestClient(app) as other:
+                return other.put(
+                    "/samples", json={"id": sample_id, "batch": "RACE"}
+                ).status_code
+
+        return run
+
+    codes = sorted(_race([submit(901), submit(902)]))
+    assert codes == [200, 422]
+    assert _counts(client)["samples"] == 500
+    ids = {r["id"] for r in client.get("/tables/samples").json()["rows"]}
+    assert len(ids & {901, 902}) == 1
+
+
+def test_cap_same_new_id_concurrent_uses_one_slot(client):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_full(499)
+
+    def submit(n):
+        def run():
+            with TestClient(app) as other:
+                return other.put(
+                    "/samples", json={"id": 950, "batch": f"R{n}"}
+                ).status_code
+
+        return run
+
+    codes = _race([submit(i) for i in range(6)])
+    # 同一新 ID：所有并发请求都成功，但只占一个名额（其余按更新处理）
+    assert set(codes) == {200}
+    assert _counts(client)["samples"] == 500
+    assert sum(
+        1 for r in client.get("/tables/samples").json()["rows"] if r["id"] == 950
+    ) == 1
+
+    # 名额已满后，同一 ID 继续提交仍按更新处理
+    assert client.put(
+        "/samples", json={"id": 950, "batch": "AFTER"}
+    ).status_code == 200
+    assert _counts(client)["samples"] == 500
+
+
+def test_cap_results_contention(client):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_full(100, 499)
+
+    def submit(result_id):
+        def run():
+            with TestClient(app) as other:
+                return other.put(
+                    "/results",
+                    json={"id": result_id, "sample_id": 1, "value": 1},
+                ).status_code
+
+        return run
+
+    assert sorted(_race([submit(9001), submit(9002)])) == [200, 422]
+    assert _counts(client)["results"] == 500
+
+
+def test_cap_rejected_write_does_not_touch_other_rows(client):
+    """超限被拒时，同一请求里的任何行都不应被改动。"""
+    _seed_full(500, 499)
+    before_samples = client.get("/tables/samples").json()["rows"]
+    resp = client.put("/samples", json={"id": 901, "batch": "X"})
+    assert resp.status_code == 422
+    assert client.get("/tables/samples").json()["rows"] == before_samples
+    # results 未参与该请求，也不应变化
+    assert _counts(client)["results"] == 499
+
+
+def test_cap_concurrent_fill_exact_capacity(client):
+    """多次并发新增时，最终行数恰好等于上限，不会超卖。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    _seed_full(497)
+    ids = list(range(2001, 2009))  # 8 个新 ID 争 3 个名额
+
+    def submit(sample_id):
+        def run():
+            with TestClient(app) as other:
+                return other.put(
+                    "/samples", json={"id": sample_id, "batch": "RACE"}
+                ).status_code
+
+        return run
+
+    with ThreadPoolExecutor(max_workers=len(ids)) as pool:
+        codes = list(pool.map(lambda fn: fn(), [submit(i) for i in ids]))
+    assert codes.count(200) == 3
+    assert codes.count(422) == 5
+    assert _counts(client)["samples"] == 500
+    present = {
+        r["id"] for r in client.get("/tables/samples").json()["rows"]
+        if r["id"] in ids
+    }
+    assert len(present) == 3
+
+
+def test_cap_does_not_count_or_block_other_table(client):
+    """samples 满时 results 的写入完全不受影响（名额互不挤占）。"""
+    _seed_full(500, 0)
+    for rid in (3001, 3002, 3003):
+        assert client.put(
+            "/results", json={"id": rid, "sample_id": 1, "value": rid}
+        ).status_code == 200
+    assert _counts(client) == {"samples": 500, "results": 3}
+
+
+def test_cap_update_existing_does_not_make_room(client):
+    """表满时更新既有行不会腾出名额，其他新 ID 仍被拒。"""
+    _seed_full(500)
+    assert client.put(
+        "/samples", json={"id": 1, "batch": "STILL-FULL"}
+    ).status_code == 200
+    assert client.put(
+        "/samples", json={"id": 902, "batch": "X"}
+    ).status_code == 422
+    assert _counts(client)["samples"] == 500

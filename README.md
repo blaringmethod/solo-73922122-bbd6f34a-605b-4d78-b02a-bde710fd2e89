@@ -70,9 +70,9 @@ docker compose exec api python -m scripts.seed_db
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/query` | 提交受管 SELECT，返回结果与逐行溯源 |
-| PUT | `/samples` | 新增/修改样本 `{id, batch}` |
+| PUT | `/samples` | 新增/修改样本 `{id, batch}`（更新不受 500 行上限限制） |
 | DELETE | `/samples/{id}` | 删除样本（连带其检测行） |
-| PUT | `/results` | 新增/修改检测 `{id, sample_id, value}`（value 可空） |
+| PUT | `/results` | 新增/修改检测 `{id, sample_id, value}`（value 可空，更新不受上限限制） |
 | DELETE | `/results/{id}` | 删除检测行 |
 | GET | `/tables/{samples|results}` | 查看当前表内容 |
 | GET | `/meta` | 表结构、行数、上限 |
@@ -114,7 +114,18 @@ uvicorn app.main:app --reload
 TEST_DATABASE_DSN=$DATABASE_ADMIN_DSN pytest -q
 ```
 
-表行数各有 500 行上限，超限的写入会被拒绝（422）。
+表行数各有 500 行上限，**每张表单独计算**。写入规则（`PUT /samples`、
+`PUT /results` 一致）：
+
+- 同一 ID 已存在时按更新处理，**不受上限限制**（历史数据已超限也可更新）；
+- 仅「新增」受上限约束：表已有 500 行时返回 **422**，且**不写入任何数据**
+  （名额判定与写入在同一事务内完成，失败整体回滚）；
+- 删除使行数低于 500 后即可再次新增；
+- 并发：两张表各自的写入通过事务级咨询锁串行化。两个不同 ID 争最后一个
+  名额时只有一条成功，另一条返回 422；同一新 ID 的并发提交只占一个名额，
+  其余按更新处理；
+- 写锁用非阻塞 try-lock 加有界退避重试实现，10 秒内拿不到锁返回 **503**
+  （同样未改动数据，可安全重试），不会无限悬挂。
 
 ## 六、目录结构
 

@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import db
+from .config import settings
 from .service import QueryFailure, run_lineage_query
 from .sql_validate import TABLE_SCHEMA, UnsupportedSQLError
 
@@ -123,33 +124,84 @@ def query(payload: QueryRequest) -> QueryResponse:
 # --------------------------------------------------------------------------- #
 # 数据维护（期间可改批次、增改删检测）
 # --------------------------------------------------------------------------- #
-@app.put("/samples", tags=["数据维护"], summary="新增或修改样本（upsert）")
-def upsert_sample(payload: SampleIn) -> dict[str, Any]:
+_WRITE_ERROR_RESPONSES = {
+    422: {"description": "达到 500 行上限或引用不存在，未写入"},
+    503: {"description": "写入繁忙，未改动数据，可重试"},
+}
+_SAMPLE_ERROR_RESPONSES = {
+    422: {"description": "达到 500 行上限，未写入"},
+    503: _WRITE_ERROR_RESPONSES[503],
+}
+
+
+def _run_write(action, *args) -> None:
+    """执行一次数据维护写操作，把领域异常映射成 HTTP 状态码。"""
     try:
-        db.upsert_sample(payload.id, payload.batch)
-    except ValueError as exc:
+        action(*args)
+    except db.RowLimitExceeded as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except db.WriteBusy as exc:
+        # 未改动任何数据，客户端可安全重试
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        # 例如 sample_id 不存在（外键），同样不改动数据
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.put(
+    "/samples",
+    tags=["数据维护"],
+    summary="新增或修改样本（upsert）",
+    description=(
+        "同一 ID 已存在时按更新处理，始终允许（即使表已超过 500 行）。"
+        "新增且 samples 表已有 500 行时返回 422，且不写入任何数据。"
+        "名额按表单独计算，results 表满不影响本接口。"
+        "短时间内无法获得写锁时返回 503，此时同样未改动数据，可安全重试。"
+    ),
+    responses=_SAMPLE_ERROR_RESPONSES,
+)
+def upsert_sample(payload: SampleIn) -> dict[str, Any]:
+    _run_write(db.upsert_sample, payload.id, payload.batch)
     return {"status": "ok", "table": "samples", "id": payload.id}
 
 
-@app.delete("/samples/{sample_id}", tags=["数据维护"], summary="删除样本（连带其检测行）")
+@app.delete(
+    "/samples/{sample_id}",
+    tags=["数据维护"],
+    summary="删除样本（连带其检测行）",
+    responses={503: _WRITE_ERROR_RESPONSES[503]},
+)
 def remove_sample(sample_id: int) -> dict[str, Any]:
-    db.delete_sample(sample_id)
+    _run_write(db.delete_sample, sample_id)
     return {"status": "ok", "table": "samples", "id": sample_id}
 
 
-@app.put("/results", tags=["数据维护"], summary="新增或修改检测结果（upsert，value 可空）")
+@app.put(
+    "/results",
+    tags=["数据维护"],
+    summary="新增或修改检测结果（upsert，value 可空）",
+    description=(
+        "同一 ID 已存在时按更新处理，始终允许（即使表已超过 500 行）。"
+        "新增且 results 表已有 500 行时返回 422，且不写入任何数据。"
+        "名额按表单独计算，samples 表满不影响本接口。"
+        "sample_id 不存在时同样返回 422，未写入。"
+        "短时间内无法获得写锁时返回 503，此时同样未改动数据，可安全重试。"
+    ),
+    responses=_WRITE_ERROR_RESPONSES,
+)
 def upsert_result(payload: ResultIn) -> dict[str, Any]:
-    try:
-        db.upsert_result(payload.id, payload.sample_id, payload.value)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+    _run_write(db.upsert_result, payload.id, payload.sample_id, payload.value)
     return {"status": "ok", "table": "results", "id": payload.id}
 
 
-@app.delete("/results/{result_id}", tags=["数据维护"], summary="删除检测结果")
+@app.delete(
+    "/results/{result_id}",
+    tags=["数据维护"],
+    summary="删除检测结果",
+    responses={503: _WRITE_ERROR_RESPONSES[503]},
+)
 def remove_result(result_id: int) -> dict[str, Any]:
-    db.delete_result(result_id)
+    _run_write(db.delete_result, result_id)
     return {"status": "ok", "table": "results", "id": result_id}
 
 
@@ -172,5 +224,6 @@ def meta() -> dict[str, Any]:
             name: {"columns": list(cols), "row_count": counts[name]}
             for name, cols in TABLE_SCHEMA.items()
         },
-        "max_rows_per_table": 500,
+        # 每张表各自的独立名额
+        "max_rows_per_table": settings.max_rows,
     }

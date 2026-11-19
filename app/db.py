@@ -1,10 +1,12 @@
 """PostgreSQL 访问层：schema 初始化、快照事务、溯源函数、数据维护。"""
 from __future__ import annotations
 
+import random
+import time
 import uuid
 from contextlib import contextmanager
 from decimal import Decimal
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
@@ -127,13 +129,116 @@ def count_rows() -> dict[str, int]:
     return out
 
 
-def assert_row_caps() -> None:
-    counts = count_rows()
-    for table, n in counts.items():
-        if n > settings.max_rows:
-            raise ValueError(
-                f"表 {table} 现有 {n} 行，超过上限 {settings.max_rows} 行"
+class RowLimitExceeded(ValueError):
+    """新增行会超过该表的行数上限（更新既有行不受限）。"""
+
+
+class WriteBusy(RuntimeError):
+    """短时间内没能拿到该表的写锁；请求未做任何改动，可重试。"""
+
+
+# 每张表一把事务级咨询锁：同一张表的写入串行化，不同表互不阻塞。
+# 固定常量而非哈希，避免依赖 PostgreSQL 内部哈希函数的实现细节。
+_TABLE_WRITE_LOCKS = {
+    "samples": 0x5A51_0001,
+    "results": 0x5A51_0002,
+}
+
+# 写锁用非阻塞 try-lock + 退避重试，而不是阻塞等待：
+# 阻塞等待要依赖 PostgreSQL 后端之间的信号唤醒；连接池/受限环境里
+# 一旦唤醒丢失，请求会无限悬挂。非阻塞方式把等待放在应用侧，可设上限。
+_LOCK_WAIT_SECONDS = 10.0
+_LOCK_RETRY_MIN_SECONDS = 0.005
+_LOCK_RETRY_MAX_SECONDS = 0.1
+
+
+def _try_acquire_table_write_lock(
+    conn: psycopg.Connection, table: str
+) -> bool:
+    """尝试在当前事务内获取该表的写锁（不阻塞）。
+
+    成功时事务提交/回滚即自动释放；失败时未持有任何锁。
+    """
+    return bool(
+        conn.execute(
+            "SELECT pg_try_advisory_xact_lock(%s)", (_TABLE_WRITE_LOCKS[table],)
+        ).fetchone()[0]
+    )
+
+
+def _with_table_write_locks(
+    tables: tuple[str, ...], work: Callable[[psycopg.Connection], Any]
+) -> Any:
+    """按给定顺序加表写锁后执行 ``work``，同一事务提交。
+
+    锁的获取一律非阻塞；任一锁没拿到就回滚本事务、应用侧退避后整套重试，
+    因此不会持有部分锁等待，也就不可能和别的写入互相等成死锁。
+    重试有上限，超过则抛 WriteBusy（此时没有任何数据被改动）。
+
+    名额判定与写入必须在同一条事务内完成：任何异常（含超限）都回滚，
+    不会留下「已入库却返回 422」的半成品。不同 ID 并发争用同一张表的
+    最后一个名额时由写锁串行化，只有一个能成功。
+    """
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    delay = _LOCK_RETRY_MIN_SECONDS
+    while True:
+        with admin_connect() as conn:
+            acquired_all = True
+            for table in tables:
+                if not _try_acquire_table_write_lock(conn, table):
+                    acquired_all = False
+                    break
+            if acquired_all:
+                try:
+                    result = work(conn)
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+                return result
+            # 没拿全锁：结束本事务（未持有事务级锁）后应用侧退避重试
+            conn.rollback()
+        if time.monotonic() >= deadline:
+            raise WriteBusy(
+                f"表 {'/'.join(tables)} 正在被其他写入占用，请稍后重试"
             )
+        # 加抖动，避免多个等待者同时醒来再次撞车
+        time.sleep(delay * (0.5 + random.random()))
+        delay = min(delay * 2, _LOCK_RETRY_MAX_SECONDS)
+
+
+def _locked_upsert(
+    table: str, row_id: int, write: Callable[[psycopg.Connection], None]
+) -> None:
+    """在表级写锁保护下执行一次 upsert（先判定名额，再写入）。"""
+
+    def work(conn: psycopg.Connection) -> None:
+        _reserve_slot(conn, table, row_id)
+        write(conn)
+
+    _with_table_write_locks((table,), work)
+
+
+def _reserve_slot(conn: psycopg.Connection, table: str, row_id: int) -> None:
+    """在已持有表写锁的事务内做「更新 or 新增」判定。
+
+    id 已存在时直接放行（按更新处理，即便表已超限也允许）；否则若新增
+    会使行数超过上限，抛出 RowLimitExceeded，调用方随事务回滚，不会
+    留下半成品数据。本函数必须在持有 ``_try_acquire_table_write_lock``
+    的事务内调用，否则并发新增时计数与插入之间会出现竞态，导致超卖名额。
+    """
+    exists = conn.execute(
+        f"SELECT 1 FROM {table} WHERE id = %s", (row_id,)
+    ).fetchone()
+    if exists is not None:
+        return
+
+    total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    if total >= settings.max_rows:
+        raise RowLimitExceeded(
+            f"表 {table} 已有 {total} 行，达到上限 {settings.max_rows} 行，"
+            f"不能新增 id={row_id}；更新既有 ID 不受此限制"
+        )
 
 
 @contextmanager
@@ -197,45 +302,68 @@ def execute_sql(conn: psycopg.Connection, sql: str) -> list[dict[str, Any]]:
 # 数据维护接口（各自短事务，立即生效，不影响进行中的旧快照事务）
 # --------------------------------------------------------------------------- #
 def upsert_sample(sample_id: int, batch: str) -> None:
-    assert_row_caps()
-    with admin_connect(autocommit=True) as conn:
+    """新增或修改样本。
+
+    名额按 samples 表单独计算：仅新增且表已满 500 行时拒绝；
+    更新既有 ID 始终允许（即使历史数据已超限）。整个判定与写入在
+    同一事务、同一把表级写锁内完成，失败则整体回滚。
+    """
+
+    def write(conn: psycopg.Connection) -> None:
         conn.execute(
             "INSERT INTO samples(id, batch) VALUES (%s, %s) "
             "ON CONFLICT (id) DO UPDATE SET batch = EXCLUDED.batch",
             (sample_id, batch),
         )
-    assert_row_caps()
+
+    _locked_upsert("samples", sample_id, write)
 
 
 def delete_sample(sample_id: int) -> None:
-    with admin_connect(autocommit=True) as conn:
+    """删除样本及其检测行。
+
+    同时持有 samples / results 两把表写锁（固定顺序），与并发的
+    upsert/delete 串行化，不会出现「删到一半被计数」的中间态。
+    """
+
+    def work(conn: psycopg.Connection) -> None:
         conn.execute("DELETE FROM results WHERE sample_id = %s", (sample_id,))
         conn.execute("DELETE FROM samples WHERE id = %s", (sample_id,))
+
+    _with_table_write_locks(("samples", "results"), work)
 
 
 def upsert_result(
     result_id: int, sample_id: int, value: float | int | None
 ) -> None:
-    assert_row_caps()
-    with admin_connect(autocommit=True) as conn:
+    """新增或修改检测行；名额按 results 表单独计算（规则同 upsert_sample）。"""
+
+    def write(conn: psycopg.Connection) -> None:
         # 显式检查外键，给出可读错误
         exists = conn.execute(
             "SELECT 1 FROM samples WHERE id = %s", (sample_id,)
         ).fetchone()
         if not exists:
             raise ValueError(f"sample_id={sample_id} 不存在")
-        conn.execute(
-            "INSERT INTO results(id, sample_id, value) VALUES (%s, %s, %s) "
-            "ON CONFLICT (id) DO UPDATE SET sample_id = EXCLUDED.sample_id, "
-            "value = EXCLUDED.value",
-            (result_id, sample_id, value),
-        )
-    assert_row_caps()
+        try:
+            conn.execute(
+                "INSERT INTO results(id, sample_id, value) VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO UPDATE SET sample_id = EXCLUDED.sample_id, "
+                "value = EXCLUDED.value",
+                (result_id, sample_id, value),
+            )
+        except psycopg.errors.ForeignKeyViolation as exc:
+            # 检查与插入之间样本被并发删除：整条事务回滚，按 422 处理
+            raise ValueError(f"sample_id={sample_id} 不存在") from exc
+
+    _locked_upsert("results", result_id, write)
 
 
 def delete_result(result_id: int) -> None:
-    with admin_connect(autocommit=True) as conn:
+    def work(conn: psycopg.Connection) -> None:
         conn.execute("DELETE FROM results WHERE id = %s", (result_id,))
+
+    _with_table_write_locks(("results",), work)
 
 
 def _jsonable(value: Any) -> Any:
